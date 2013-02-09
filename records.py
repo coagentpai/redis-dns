@@ -2,6 +2,13 @@ import dns.rdtypes.IN.A
 import dns.rdtypes.ANY.MX 
 import dns.rdtypes.ANY.CNAME
 import dns.rdtypes.ANY.TXT
+import dns.rdtypes.ANY.NS
+
+class NS(dns.rdtypes.ANY.NS.NS):
+    def __init__(self, target):
+        super(NS, self).__init__(dns.rdataclass.ANY, dns.rdatatype.NS, target)
+        pass
+    pass # END Class NS
 
 class MX(dns.rdtypes.ANY.MX.MX):
     def __init__(self, preference, exchange):
