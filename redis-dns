@@ -17,6 +17,7 @@ import datetime
 from gredis import get_redis
 import records
 
+# curl -XGET <username>:<password>@<host>:<port>/update?myip=<IP>&hostname=<hostname>
 # TODO: Cleanup logging, add a handler and create an option for a logfile.
 class Missing_Zone(Exception):
     pass # END Class Missing_Zone
@@ -33,6 +34,7 @@ def dns_handler(s, peer, data, zone):
     q = request.question[0]
     name = q.name
     rdtype = q.rdtype
+    # Return NS records for the zone we are serving
     if name == zone:
         if rdtype == dns.rdatatype.NS:
             ns_records = [records.NS(dns.name.from_unicode(target)) for target in get_redis().smembers('%s:NAMESERVERS' % zone)]
@@ -40,10 +42,11 @@ def dns_handler(s, peer, data, zone):
             s.sendto(reply.to_wire(), peer)
             return
         pass
-
+    # Serve a subdomain of the current zone.
     if name.is_subdomain(zone):
         IP = get_redis().hget("NODE:%s" % name, 'A')
         TXT = get_redis().hget("NODE:%s" % name, 'TXT')
+        # FIXME: If this record type is present in redis we should add it to the rrset.
         IPV6 = get_redis().hget("NODE:%s" % name, 'AAAA')
         if not IP:
             reply.set_rcode(dns.rcode.NXDOMAIN)
@@ -66,6 +69,7 @@ def dns_handler(s, peer, data, zone):
                 pass
             pass
     else:
+        # We don't want to serve records for anything other than what we are authorative for.
         reply.set_rcode(dns.rcode.REFUSED)
         pass
     s.sendto(reply.to_wire(), peer)
@@ -135,6 +139,7 @@ def web_service_handler(env, start_response):
             hostname = dns.name.from_unicode(unicode(args['hostname'].pop()))
             if not valid_auth(username, password, hostname):
                 return bad_auth()
+            # Default to the request IP if this param is not present? I think Dynect does this. 
             ip = args['myip'].pop()
             get_redis().hmset('NODE:%s' % hostname, {'A': ip, 'UPDATED': datetime.datetime.utcnow().isoformat() + 'Z'})
             logging.info('Set %s to %s' % (hostname, ip)) 
