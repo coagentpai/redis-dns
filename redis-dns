@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 import gevent
 import gevent.pywsgi
 from gevent import socket
@@ -6,6 +6,7 @@ import gevent.dns
 
 import dns.message
 import dns.rdata
+import pwd
 from functools import partial
 import logging
 import redis
@@ -16,13 +17,17 @@ import datetime
 from gredis import get_redis
 import records
 
+# TODO: Cleanup logging, add a handler and create an option for a logfile.
 class Missing_Zone(Exception):
     pass # END Class Missing_Zone
 
 def dns_handler(s, peer, data, zone):
+    # Unpack the request from the wire
     request = dns.message.from_wire(data)
     reply = dns.message.make_response(request)
+    # We are the authorative response
     reply.flags |= dns.flags.AA
+    # No recursion available
     reply.flags &= ~dns.flags.RA
     # We only answer the first question
     q = request.question[0]
@@ -65,7 +70,8 @@ def dns_handler(s, peer, data, zone):
         pass
     s.sendto(reply.to_wire(), peer)
 
-
+# When a greenlet (lightweight thread) throws an unhandled exception this method does 
+# the best it can to make a meaningful response.
 def dns_failure(s, peer, data, greenlet):
     logging.error(greenlet.exception)
     try:
@@ -74,7 +80,9 @@ def dns_failure(s, peer, data, greenlet):
         respone.set_rcode(dns.rcode.SERVFAIL)
         s.sendto(reply.to_wire(), peer)
     except Exception as e:
+        # We likely cannot unpack the wire format
         # Bad request? Should we reply? What would be the ID?
+        logging.exception('Exception while replying to malformed request')
         pass
 
 def valid_auth(username, password, domain):
@@ -85,6 +93,8 @@ def valid_auth(username, password, domain):
     return True
 
 def add_user(username, password, domain):
+    # TODO: Password hashing with a salt stored in redis
+    # generate the salt at daemon startup if it is missing from redis.
     get_redis().hset('USER:%s' % username, 'password', password)
     get_redis().sadd('DOMAIN:%s' % username, domain)
     pass
@@ -104,22 +114,27 @@ def web_service_handler(env, start_response):
         records = [{'type': key, 'value': value} for key, value in get_redis().hgetall(node).items() if key != 'UPDATED']
         return (node_name, {'records': records, 'updated':  get_redis().hget(node, 'UPDATED')})
 
+    def bad_auth():
+        start_response('401 Not Authorized', [('Content-Type', 'text/plain')])
+        return ['Not Authorized\n']
+
     if env['PATH_INFO'] == '/info':
         records = get_redis().keys('NODE:*') 
         start_response('200 OK', [('Content-Type', 'application/json'), ('Access-Control-Allow-Origin', '*')])
         records = dict(map(format_json, records))
         return [ json.dumps(records) ]
-        pass
 
-    if env['PATH_INFO'] == '/update':
+    if env['PATH_INFO'] in ('/update', '/nic/update'):
         args = urlparse.parse_qs(env['QUERY_STRING'])
         try:
+            if env.get('HTTP_AUTHORIZATION') is None:
+                return bad_auth()
+
             # Basic <base64 encoded - username:password> 
             username, password = env['HTTP_AUTHORIZATION'].split()[1].decode('base64').split(':')
             hostname = dns.name.from_unicode(unicode(args['hostname'].pop()))
             if not valid_auth(username, password, hostname):
-                start_response('401 Not Authorized', [('Content-Type', 'text/plain')])
-                return ['Not Authorized\n']
+                return bad_auth()
             ip = args['myip'].pop()
             get_redis().hmset('NODE:%s' % hostname, {'A': ip, 'UPDATED': datetime.datetime.utcnow().isoformat() + 'Z'})
             logging.info('Set %s to %s' % (hostname, ip)) 
@@ -140,7 +155,7 @@ def web_service(port):
     server.start()
     pass
 
-def serve(zone = None, port = 8080):
+def serve(dns_socket, port=8080, zone = None):
     if zone is None:
         zone = get_redis().get('ZONE')
         pass
@@ -148,21 +163,19 @@ def serve(zone = None, port = 8080):
     if zone is None:
         raise Missing_Zone('DNS zone not set')
         pass
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(('0.0.0.0', 53))
     web_service(port)
     dns_zone = dns.name.from_unicode(unicode(zone))
     while True:
-        data, peer = s.recvfrom(8192)
-        dns_greenlet = gevent.spawn(dns_handler, s, peer, data, dns_zone) 
-        dns_greenlet.link_exception(partial(dns_failure, s, peer, data))
+        data, peer = dns_socket.recvfrom(8192)
+        dns_greenlet = gevent.spawn(dns_handler, dns_socket, peer, data, dns_zone) 
+        dns_greenlet.link_exception(partial(dns_failure, dns_socket, peer, data))
 
 
 if __name__ == '__main__':
     # Be a good Unix daemon
     import argparse
     import daemon
+    import daemon.pidfile
 
     parser = argparse.ArgumentParser(description='Greenlet dynamic DNS server')
     subparsers = parser.add_subparsers(help='The operation that you want to run on the server.')
@@ -183,15 +196,21 @@ if __name__ == '__main__':
         pass
 
     def run(args):
+        dns_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dns_socket.bind(('0.0.0.0', 53))
+        user_info = pwd.getpwnam(args.as_user)
+        uid = user_info.pw_uid
+        gid = user_info.pw_gid
+        pidfile = daemon.pidfile.TimeoutPIDLockFile('/var/run/redis-dns/dns.pid')
         if args.background:
-            with daemon.DaemonContext():
+            with daemon.DaemonContext(files_preserve = [ dns_socket ], pidfile=pidfile, uid = uid, gid = gid):
                 gevent.reinit()
-                serve(port=args.port)
+                serve(dns_socket, port=args.port)
                 pass
             pass
         else:
             try:
-                serve(port=args.port)
+                serve(dns_socket, port=args.port)
             except Missing_Zone as e:
                 parser.error('No zone has been defined, try providing one or setting it with the zone sub-command.')
             pass
@@ -208,6 +227,7 @@ if __name__ == '__main__':
     
     # Daemon parser 
     run_parser = subparsers.add_parser('run', help='Start the DNS server.')
+    run_parser.add_argument('--run-as', dest='as_user', default='nobody', help='User to change to after setup')
     run_parser.add_argument('-b', '--background', dest='background', action='store_true', help='Background the server')
     run_parser.add_argument('-p', '--web-port', dest='port', default=8080, type=int, help='Port for the web service')
     run_parser.set_defaults(func=run)
